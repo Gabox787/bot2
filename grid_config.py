@@ -1,8 +1,13 @@
 # Telegram настройки
 TELEGRAM_TOKEN = '8530434492:AAHE7S6GHnLImGUIkpyqeKrr4slOwR5gIDU'
-CHAT_ID = '715162339'
+# Убрали кавычки, чтобы ID был числом (это важно для библиотеки python-telegram-bot)
+CHAT_ID = 715162339
 
 # Настройки сетки
 SYMBOL = "BTCUSDT"
-GRID_STEP = 0.01  # Шаг 0.5%
-GRID_LEVELS = 3  # По 3 уровня вверх и вниз
+# Уменьшил шаг до 0.001 (0.1%), чтобы бот прислал сигнал почти сразу после запуска
+GRID_STEP = 0.001 
+GRID_LEVELS = 3
+
+# Добавили пропущенный параметр, на который ругался бот
+IS_TESTNET = True
