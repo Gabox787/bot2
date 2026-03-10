@@ -1,5 +1,5 @@
 # Telegram настройки
-TELEGRAM_TOKEN = '8530434492:AAGexatbNgKDdWxx9GFpbKW1pyRxfVjfYac'
+TELEGRAM_TOKEN = '8530434492:AAHt_hej8rwQLiefA9f0yd97NNyJ4DzX7KY'
 # Убрали кавычки, чтобы ID был числом (это важно для библиотеки python-telegram-bot)
 CHAT_ID = 715162339
 
