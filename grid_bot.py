@@ -1,49 +1,67 @@
 import asyncio
 import grid_config as config
-from pybit.unified_trading import HTTP  # Библиотека для связи с биржей
+from pybit.unified_trading import HTTP
 from telegram import Bot
+from grid_logic import calculate_grid
 
-# Подключаемся к бирже (даже без ключей можно смотреть цену)
+# Подключаемся к бирже (публичные данные доступны без ключей)
 session = HTTP(testnet=config.IS_TESTNET)
-tg_bot = Bot(token=config.TELEGRAM_TOKEN)
 
 async def get_current_price():
-    """Получает актуальную цену с биржи"""
-    response = session.get_tickers(category="spot", symbol=config.SYMBOL)
-    return float(response['result']['list'][0]['lastPrice'])
+    """Получает актуальную цену с биржи Bybit"""
+    try:
+        response = session.get_tickers(category="spot", symbol=config.SYMBOL)
+        return float(response['result']['list'][0]['lastPrice'])
+    except Exception as e:
+        print(f"Ошибка при получении цены: {e}")
+        return None
 
 async def monitor_market():
-    print(f"--- Бот-советник запущен для {config.SYMBOL} ---")
-    
-    # 1. Берем стартовую цену и строим виртуальную сетку
-    start_price = await get_current_price()
-    from grid_logic import calculate_grid
-    buys, sells = calculate_grid(start_price, config.GRID_STEP, config.GRID_LEVELS)
-    
-    print(f"Стартовая цена: {start_price}. Сетка построена.")
-    print(f"Жду цену покупки: {buys[0]} или продажи: {sells[0]}")
+    # Инициализируем бота внутри асинхронного контекста
+    async with Bot(token=config.TELEGRAM_TOKEN) as tg_bot:
+        print(f"--- Бот-советник запущен для {config.SYMBOL} ---")
+        
+        # 1. Берем стартовую цену и строим виртуальную сетку
+        start_price = await get_current_price()
+        if not start_price:
+            print("Не удалось получить начальную цену. Проверь интернет или символ монеты.")
+            return
 
-    # 2. Бесконечный цикл слежения
-    while True:
-        try:
-            current_price = await get_current_price()
-            
-            # Проверяем касание первого уровня покупки
-            if current_price <= buys[0]:
-                message = f"📉 Цена упала до уровня покупки: {current_price}\nПокупаем {config.SYMBOL}?"
-                await tg_bot.send_message(chat_id=config.CHAT_ID, text=message)
-                break # Остановим для теста, чтобы не спамил
+        buys, sells = calculate_grid(start_price, config.GRID_STEP, config.GRID_LEVELS)
+        
+        print(f"Стартовая цена: {start_price} USDT")
+        print(f"Сетка построена. Жду покупку на {buys[0]} или продажу на {sells[0]}")
+
+        # 2. Бесконечный цикл слежения за рынком
+        while True:
+            try:
+                current_price = await get_current_price()
+                if not current_price:
+                    await asyncio.sleep(10)
+                    continue
+
+                # Проверяем касание первого уровня покупки (цена упала)
+                if current_price <= buys[0]:
+                    message = f"📉 **GRID SIGNAL: BUY**\nЦена {config.SYMBOL} упала до: **{current_price}**\nТвой уровень покупки: {buys[0]}"
+                    await tg_bot.send_message(chat_id=config.CHAT_ID, text=message, parse_mode='Markdown')
+                    print("Сигнал на покупку отправлен!")
+                    break # Останавливаем для теста, чтобы не спамил сообщениями
+                    
+                # Проверяем касание первого уровня продажи (цена выросла)
+                elif current_price >= sells[0]:
+                    message = f"📈 **GRID SIGNAL: SELL**\nЦена {config.SYMBOL} выросла до: **{current_price}**\nТвой уровень продажи: {sells[0]}"
+                    await tg_bot.send_message(chat_id=config.CHAT_ID, text=message, parse_mode='Markdown')
+                    print("Сигнал на продажу отправлен!")
+                    break
+
+                await asyncio.sleep(5) # Пауза 5 секунд между проверками цены
                 
-            # Проверяем касание первого уровня продажи
-            elif current_price >= sells[0]:
-                message = f"📈 Цена выросла до уровня продажи: {current_price}\nПродаем {config.SYMBOL}?"
-                await tg_bot.send_message(chat_id=config.CHAT_ID, text=message)
-                break
-                
-            await asyncio.sleep(5) # Проверяем каждые 5 секунд
-        except Exception as e:
-            print(f"Ошибка: {e}")
-            await asyncio.sleep(10)
+            except Exception as e:
+                print(f"Ошибка в цикле: {e}")
+                await asyncio.sleep(10)
 
 if __name__ == "__main__":
-    asyncio.run(monitor_market())
+    try:
+        asyncio.run(monitor_market())
+    except KeyboardInterrupt:
+        print("\nБот остановлен пользователем.")
