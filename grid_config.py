@@ -10,4 +10,4 @@ GRID_STEP = 0.001
 GRID_LEVELS = 3
 
 # Добавили пропущенный параметр, на который ругался бот
-IS_TESTNET = True
+IS_TESTNET = False
