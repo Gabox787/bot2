@@ -1,4 +1,4 @@
-import config
+import grid_config as config # Импортируем именно новые настройки
 from grid_logic import calculate_grid
 
 def main():
