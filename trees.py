@@ -100,12 +100,10 @@ class TradeJournal:
 def add_indicators(df, cfg):
     df = df.copy()
 
-    # EMA 9, 21, 50
     df['ema_fast'] = df['close'].ewm(span=cfg['ema_fast'], adjust=False).mean()
     df['ema_mid'] = df['close'].ewm(span=cfg['ema_mid'], adjust=False).mean()
     df['ema_slow'] = df['close'].ewm(span=cfg['ema_slow'], adjust=False).mean()
 
-    # RSI
     delta = df['close'].diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
@@ -113,14 +111,12 @@ def add_indicators(df, cfg):
     avg_loss = loss.ewm(alpha=1 / cfg['rsi_period'], min_periods=cfg['rsi_period']).mean()
     df['rsi'] = 100 - (100 / (1 + (avg_gain / avg_loss)))
 
-    # MACD
     ema_macd_fast = df['close'].ewm(span=cfg['macd_fast'], adjust=False).mean()
     ema_macd_slow = df['close'].ewm(span=cfg['macd_slow'], adjust=False).mean()
     df['macd_line'] = ema_macd_fast - ema_macd_slow
     df['macd_signal'] = df['macd_line'].ewm(span=cfg['macd_signal'], adjust=False).mean()
     df['macd_histogram'] = df['macd_line'] - df['macd_signal']
 
-    # Volume
     df['vol_ma'] = df['volume'].rolling(cfg['vol_ma_period']).mean()
 
     return df
@@ -149,7 +145,6 @@ def get_signal(df):
     if pd.isna(rsi) or pd.isna(macd_line) or pd.isna(macd_signal) or pd.isna(vol_ma):
         return None
 
-    # LONG: EMA9 > EMA21 > EMA50, цена выше EMA9, RSI 45-70, MACD > Signal, объём ок
     if (ema_fast > ema_mid > ema_slow and
             price > ema_fast and
             45 < rsi < 70 and
@@ -157,7 +152,6 @@ def get_signal(df):
             volume > vol_ma * 0.8):
         return 'LONG'
 
-    # SHORT: EMA9 < EMA21 < EMA50, цена ниже EMA9, RSI 30-55, MACD < Signal, объём ок
     if (ema_fast < ema_mid < ema_slow and
             price < ema_fast and
             30 < rsi < 55 and
@@ -179,7 +173,6 @@ class SignalBot:
         self.last_signal = {}
 
     async def scan(self, app_bot):
-        # --- Проверка открытых позиций ---
         for trade in self.active_trades[:]:
             try:
                 ticker = await asyncio.to_thread(self.exchange.fetch_ticker, trade['symbol'])
@@ -190,7 +183,6 @@ class SignalBot:
                 else:
                     profit_now = (trade['entry'] - curr_p) / trade['entry']
 
-                # Обновляем экстремум
                 if trade['side'] == 'LONG':
                     if curr_p > trade.get('highest_price', trade['entry']):
                         trade['highest_price'] = curr_p
@@ -198,7 +190,6 @@ class SignalBot:
                     if curr_p < trade.get('lowest_price', trade['entry']):
                         trade['lowest_price'] = curr_p
 
-                # Безубыток + трейлинг
                 if not trade.get('breakeven_hit') and profit_now >= self.cfg['breakeven_trigger']:
                     trade['breakeven_hit'] = True
                     trade['trailing_active'] = True
@@ -223,7 +214,6 @@ class SignalBot:
                         if new_sl < trade['sl']:
                             trade['sl'] = new_sl
 
-                # Проверка SL / TP
                 is_sl = (trade['side'] == 'LONG' and curr_p <= trade['sl']) or (
                     trade['side'] == 'SHORT' and curr_p >= trade['sl'])
                 is_tp = (trade['side'] == 'LONG' and curr_p >= trade['tp']) or (
@@ -255,7 +245,6 @@ class SignalBot:
                         )
                     self.active_trades.remove(trade)
 
-                # Проверка разворотного сигнала
                 else:
                     try:
                         raw = await asyncio.to_thread(
@@ -283,7 +272,6 @@ class SignalBot:
                                     parse_mode='HTML'
                                 )
                             self.active_trades.remove(trade)
-                            # Сразу открываем в обратную сторону
                             await self._open_trade(app_bot, trade['symbol'], reversal, curr_p)
                     except Exception as e:
                         logger.error(f"Reversal check error [{trade['symbol']}]: {e}")
@@ -291,7 +279,6 @@ class SignalBot:
             except Exception as e:
                 logger.error(f"Trade monitor error [{trade['symbol']}]: {e}")
 
-        # --- Поиск новых сигналов ---
         for symbol in self.cfg['symbols']:
             if any(t['symbol'] == symbol for t in self.active_trades):
                 continue
