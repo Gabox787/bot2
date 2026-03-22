@@ -3,7 +3,7 @@ import pandas as pd
 import asyncio
 import logging
 import os
-from datetime import datetime, timedelta, time as dt_time
+from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 from telegram.request import HTTPXRequest
@@ -12,7 +12,7 @@ from telegram.request import HTTPXRequest
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- CONFIG (ОБНОВЛЕННЫЕ ПАРАМЕТРЫ РИСКА) ---
+# --- CONFIG ---
 CONFIG = {
     'telegram_token': os.environ.get('TELEGRAM_TOKEN'),
     'chat_id': os.environ.get('CHAT_ID'),
@@ -33,12 +33,11 @@ CONFIG = {
     'balance': 1000,
     'leverage': 20,
     'risk_per_trade': 0.02,
-    # --- ИЗМЕНЕННЫЕ НАСТРОЙКИ ---
-    'stop_loss_pct': 0.015,       # Стоп 1.5% (был 0.7%)
-    'take_profit_pct': 0.045,      # Тейк 4.5% (был 3.0%)
-    'breakeven_trigger': 0.02,     # БУ при +2% (был 0.75%)
-    'trailing_distance': 0.01,     # Трейлинг 1% (был 0.7%)
-    # ----------------------------
+    'stop_loss_pct': 0.015,
+    'take_profit_pct': 0.045,
+    'breakeven_trigger': 0.02,
+    'trailing_distance': 0.01,
+    'max_ema_dist': 0.006,          # Вход на откате
     'commission_rate': 0.00055 * 2,
 }
 
@@ -105,18 +104,22 @@ def add_indicators(df, cfg):
     ema_macd_slow = df['close'].ewm(span=cfg['macd_slow'], adjust=False).mean()
     df['macd_line'] = ema_macd_fast - ema_macd_slow
     df['macd_signal'] = df['macd_line'].ewm(span=cfg['macd_signal'], adjust=False).mean()
-    df['macd_histogram'] = df['macd_line'] - df['macd_signal']
     df['vol_ma'] = df['volume'].rolling(cfg['vol_ma_period']).mean()
     return df
 
 def get_signal(df):
     if len(df) < 50: return None
     c = df.iloc[-1]
+    dist = abs(c['close'] - c['ema_fast']) / c['ema_fast']
+    
     if (c['ema_fast'] > c['ema_mid'] > c['ema_slow'] and c['close'] > c['ema_fast'] and 
-        45 < c['rsi'] < 70 and c['macd_line'] > c['macd_signal'] and c['volume'] > c['vol_ma'] * 0.8):
+        dist <= CONFIG['max_ema_dist'] and 45 < c['rsi'] < 70 and 
+        c['macd_line'] > c['macd_signal'] and c['volume'] > c['vol_ma'] * 0.8):
         return 'LONG'
+    
     if (c['ema_fast'] < c['ema_mid'] < c['ema_slow'] and c['close'] < c['ema_fast'] and 
-        30 < c['rsi'] < 55 and c['macd_line'] < c['macd_signal'] and c['volume'] > c['vol_ma'] * 0.8):
+        dist <= CONFIG['max_ema_dist'] and 30 < c['rsi'] < 55 and 
+        c['macd_line'] < c['macd_signal'] and c['volume'] > c['vol_ma'] * 0.8):
         return 'SHORT'
     return None
 
@@ -131,8 +134,11 @@ class SignalBot:
     async def scan(self, app_bot):
         for trade in self.active_trades[:]:
             try:
-                ticker = await asyncio.to_thread(self.exchange.fetch_ticker, trade['symbol'])
-                curr_p = ticker['last']
+                raw = await asyncio.to_thread(self.exchange.fetch_ohlcv, trade['symbol'], self.cfg['timeframe'], limit=50)
+                df = add_indicators(pd.DataFrame(raw, columns=['ts','open','high','low','close','volume']), self.cfg)
+                c = df.iloc[-1]
+                curr_p = c['close']
+
                 side_mult = 1 if trade['side'] == 'LONG' else -1
                 profit_now = (curr_p - trade['entry']) / trade['entry'] * side_mult
 
@@ -146,7 +152,7 @@ class SignalBot:
                     trade['trailing_active'] = True
                     trade['sl'] = trade['entry']
                     await app_bot.send_message(chat_id=self.cfg['chat_id'], 
-                        text=f"🔄 <b>Безубыток: {trade['symbol']}</b>\nСтоп → {trade['sl']}", parse_mode='HTML')
+                        text=f"🔄 <b>Безубыток: {trade['symbol']}</b>\nСтоп перенесен в 0.", parse_mode='HTML')
 
                 if trade.get('trailing_active'):
                     if trade['side'] == 'LONG':
@@ -156,11 +162,22 @@ class SignalBot:
                         new_sl = round(trade['lowest_price'] * (1 + self.cfg['trailing_distance']), 8)
                         if new_sl < trade['sl']: trade['sl'] = new_sl
 
+                # --- УМНЫЙ ВЫХОД (ФИЛЬТР ШУМА) ---
+                exit_reason = None
+                if trade['side'] == 'LONG':
+                    # Выходим только если: EMA пересеклись И цена закрылась ниже И RSI потерял силу
+                    if c['ema_fast'] < c['ema_mid'] and curr_p < c['ema_mid'] and c['rsi'] < 50:
+                        exit_reason = "CONFIRMED REVERSAL (LONG) ⚠️"
+                elif trade['side'] == 'SHORT':
+                    # Выходим только если: EMA пересеклись И цена закрылась выше И RSI вырос
+                    if c['ema_fast'] > c['ema_mid'] and curr_p > c['ema_mid'] and c['rsi'] > 50:
+                        exit_reason = "CONFIRMED REVERSAL (SHORT) ⚠️"
+
                 is_sl = (trade['side'] == 'LONG' and curr_p <= trade['sl']) or (trade['side'] == 'SHORT' and curr_p >= trade['sl'])
                 is_tp = (trade['side'] == 'LONG' and curr_p >= trade['tp']) or (trade['side'] == 'SHORT' and curr_p <= trade['tp'])
 
-                if is_sl or is_tp:
-                    res_type = "TAKE PROFIT 🎯" if is_tp else ("TRAILING STOP 📈" if trade.get('trailing_active') else "STOP LOSS 🛑")
+                if is_sl or is_tp or exit_reason:
+                    res_type = exit_reason if exit_reason else ("TAKE PROFIT 🎯" if is_tp else ("TRAILING STOP 📈" if trade.get('trailing_active') else "STOP LOSS 🛑"))
                     data = self.journal.log_trade(trade['symbol'], trade['side'], res_type, trade['entry'], curr_p, trade['start_time'])
                     if data:
                         icon = "✅" if data['profit_usdt'] > 0 else "❌"
@@ -176,7 +193,7 @@ class SignalBot:
                         await app_bot.send_message(chat_id=self.cfg['chat_id'], text=msg, parse_mode='HTML')
                     self.active_trades.remove(trade)
             except Exception as e:
-                logger.error(f"Trade error: {e}")
+                logger.error(f"Trade error {trade['symbol']}: {e}")
 
         for symbol in self.cfg['symbols']:
             if any(t['symbol'] == symbol for t in self.active_trades): continue
@@ -215,8 +232,7 @@ class SignalBot:
         await app_bot.send_message(chat_id=self.cfg['chat_id'], text=msg, parse_mode='HTML',
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Закрыть вручную", callback_data=trade_id)]]))
 
-# --- КОМАНДЫ ---
-
+# --- ТЕЛЕГРАМ КОМАНДЫ ---
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     balance = get_current_balance()
     active = len(bot_instance.active_trades) if bot_instance else 0
@@ -229,25 +245,18 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur_bal = get_current_balance()
     total_pnl = round(df['profit_usdt'].sum(), 2)
     wins = len(df[df['profit_usdt'] > 0])
-    loss = len(df[df['profit_usdt'] <= 0])
     wr = round((wins / len(df) * 100), 1)
     avg_time = int(df['duration_min'].mean())
-    initial_bal = CONFIG['balance']
-    df['equity'] = initial_bal + df['profit_usdt'].cumsum()
-    peak = df['equity'].cummax()
-    drawdown = round(((df['equity'] - peak) / peak * 100).min(), 2)
     coin_stats = df.groupby('symbol')['profit_usdt'].sum()
     best_c, worst_c = coin_stats.idxmax(), coin_stats.idxmin()
-    best_p, worst_p = round(coin_stats.max(), 2), round(coin_stats.min(), 2)
     msg = (
         f"📊 <b>ПОЛНАЯ СТАТИСТИКА</b>\n━━━━━━━━━━━━\n"
         f"💰 Баланс: <b>{cur_bal} USDT</b>\n"
         f"📈 Общий PnL: <b>{total_pnl} USDT</b>\n"
-        f"🎯 Win Rate: <b>{wr}%</b> ({wins}W / {loss}L)\n"
+        f"🎯 Win Rate: <b>{wr}%</b> ({wins}W / {len(df)-wins}L)\n"
         f"⏱ Ср. время сделки: <b>{avg_time} мин.</b>\n"
-        f"📉 Макс. просадка: <b>{drawdown}%</b>\n"
-        f"🏆 Лучшая монета: <b>{best_c} ({best_p}$)</b>\n"
-        f"🆘 Худшая монета: <b>{worst_c} ({worst_p}$)</b>"
+        f"🏆 Лучшая монета: <b>{best_c} ({round(coin_stats.max(), 2)}$)</b>\n"
+        f"🆘 Худшая монета: <b>{worst_c} ({round(coin_stats.min(), 2)}$)</b>"
     )
     await update.message.reply_html(msg)
 
@@ -264,17 +273,12 @@ async def active_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             roi_pct = round((curr_p - t['entry']) / t['entry'] * 100 * side_mult, 2)
             pnl_usdt = round(t['size_usdt'] * (roi_pct / 100), 2)
             total_current_pnl += pnl_usdt
-            side_icon = "🟢 LONG" if t['side'] == 'LONG' else "🔴 SHORT"
-            pnl_icon = "📈" if pnl_usdt >= 0 else "📉"
-            msg += (
-                f"<b>{t['symbol']} | {side_icon}</b>\n"
-                f"📍 Вход: {t['entry']}\n"
-                f"🎯 TP: {t['tp']} | 🛑 SL: {t['sl']}\n"
-                f"{pnl_icon} PnL: <b>{pnl_usdt}$</b> | ROI: <b>{roi_pct}%</b>\n\n"
-            )
-        except Exception as e: logger.error(f"Active error: {e}")
-    total_icon = "💰" if total_current_pnl >= 0 else "💸"
-    msg += f"━━━━━━━━━━━━━━━\n{total_icon} <b>ОБЩИЙ PNL: {round(total_current_pnl, 2)}$</b>"
+            msg += (f"<b>{t['symbol']} | {'🟢 LONG' if t['side'] == 'LONG' else '🔴 SHORT'}</b>\n"
+                    f"📍 Вход: {t['entry']}\n"
+                    f"🎯 TP: {t['tp']} | 🛑 SL: {t['sl']}\n"
+                    f"{'📈' if pnl_usdt >= 0 else '📉'} PnL: <b>{pnl_usdt}$</b> | ROI: <b>{roi_pct}%</b>\n\n")
+        except: continue
+    msg += f"━━━━━━━━━━━━━━━\n💰 <b>ОБЩИЙ PNL: {round(total_current_pnl, 2)}$</b>"
     await update.message.reply_html(msg)
 
 async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -282,16 +286,20 @@ async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     df = pd.read_csv('history.csv').tail(10)
     msg = "<b>📜 ПОСЛЕДНИЕ 10 СДЕЛОК:</b>\n\n"
     for _, r in df.iterrows():
-        icon = "✅" if r['profit_usdt'] > 0 else "❌"
-        msg += f"{icon} {r['date']} | {r['symbol']} | {r['profit_usdt']}$\n"
+        msg += f"{'✅' if r['profit_usdt'] > 0 else '❌'} {r['date']} | {r['symbol']} | {r['profit_usdt']}$\n"
     await update.message.reply_html(msg)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_html("📊 /stats, /active, /history, /start")
+    msg = ("<b>🤖 Команды:</b>\n"
+           "/start — Статус и баланс\n"
+           "/stats — Полная статистика\n"
+           "/active — Текущие сделки\n"
+           "/history — История сделок\n"
+           "/help — Это меню")
+    await update.message.reply_html(msg)
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+    query = update.callback_query; await query.answer()
     trade = next((t for t in bot_instance.active_trades if t.get('trade_id') == query.data), None)
     if trade:
         ticker = await asyncio.to_thread(bot_instance.exchange.fetch_ticker, trade['symbol'])
@@ -299,7 +307,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bot_instance.active_trades.remove(trade)
         if data:
             msg = (f"🔵 <b>ЗАКРЫТО ВРУЧНУЮ: {trade['symbol']}</b>\n"
-                   f"━━━━━━━━━━━━━━━\n"
                    f"💰 PnL: <b>{data['profit_usdt']}$</b> ({data['profit_pct']}%)\n"
                    f"📍 Вход: {trade['entry']} | 🏁 Выход: {ticker['last']}")
             await query.edit_message_text(msg, parse_mode='HTML')
