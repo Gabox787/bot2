@@ -3,6 +3,7 @@ import pandas as pd
 import asyncio
 import logging
 import os
+import time  # Добавлено для отслеживания пауз
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
@@ -39,6 +40,7 @@ CONFIG = {
     'trailing_distance': 0.01,
     'max_ema_dist': 0.006,          # Вход на откате
     'commission_rate': 0.00055 * 2,
+    'cooldown_minutes': 30,         # ПАУЗА после закрытия сделки (в минутах)
 }
 
 bot_instance = None
@@ -130,6 +132,7 @@ class SignalBot:
         self.journal = TradeJournal()
         self.active_trades = []
         self.last_signal = {}
+        self.last_exit_time = {} # Память времени выходов
 
     async def scan(self, app_bot):
         for trade in self.active_trades[:]:
@@ -165,11 +168,9 @@ class SignalBot:
                 # --- УМНЫЙ ВЫХОД (ФИЛЬТР ШУМА) ---
                 exit_reason = None
                 if trade['side'] == 'LONG':
-                    # Выходим только если: EMA пересеклись И цена закрылась ниже И RSI потерял силу
                     if c['ema_fast'] < c['ema_mid'] and curr_p < c['ema_mid'] and c['rsi'] < 50:
                         exit_reason = "CONFIRMED REVERSAL (LONG) ⚠️"
                 elif trade['side'] == 'SHORT':
-                    # Выходим только если: EMA пересеклись И цена закрылась выше И RSI вырос
                     if c['ema_fast'] > c['ema_mid'] and curr_p > c['ema_mid'] and c['rsi'] > 50:
                         exit_reason = "CONFIRMED REVERSAL (SHORT) ⚠️"
 
@@ -179,6 +180,10 @@ class SignalBot:
                 if is_sl or is_tp or exit_reason:
                     res_type = exit_reason if exit_reason else ("TAKE PROFIT 🎯" if is_tp else ("TRAILING STOP 📈" if trade.get('trailing_active') else "STOP LOSS 🛑"))
                     data = self.journal.log_trade(trade['symbol'], trade['side'], res_type, trade['entry'], curr_p, trade['start_time'])
+                    
+                    # Запоминаем время выхода
+                    self.last_exit_time[trade['symbol']] = time.time()
+
                     if data:
                         icon = "✅" if data['profit_usdt'] > 0 else "❌"
                         msg = (
@@ -197,6 +202,12 @@ class SignalBot:
 
         for symbol in self.cfg['symbols']:
             if any(t['symbol'] == symbol for t in self.active_trades): continue
+            
+            # ПРОВЕРКА ПАУЗЫ (COOLDOWN)
+            if symbol in self.last_exit_time:
+                if time.time() - self.last_exit_time[symbol] < (self.cfg['cooldown_minutes'] * 60):
+                    continue
+
             try:
                 raw = await asyncio.to_thread(self.exchange.fetch_ohlcv, symbol, self.cfg['timeframe'], limit=100)
                 df = add_indicators(pd.DataFrame(raw, columns=['ts','open','high','low','close','volume']).iloc[:-1], self.cfg)
