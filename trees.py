@@ -3,8 +3,9 @@ import pandas as pd
 import asyncio
 import logging
 import os
-import time  # Добавлено для отслеживания пауз
-from datetime import datetime
+import time
+import pytz
+from datetime import datetime, time as dt_time
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 from telegram.request import HTTPXRequest
@@ -31,7 +32,8 @@ CONFIG = {
     'macd_slow': 26,
     'macd_signal': 9,
     'vol_ma_period': 20,
-    'balance': 1000,
+    'balance': 2000,                # УСТАНОВЛЕНО: 2000
+    'fixed_order_size': 1000,       # УСТАНОВЛЕНО: Фикс вход 1000
     'leverage': 20,
     'risk_per_trade': 0.02,
     'stop_loss_pct': 0.015,
@@ -53,6 +55,33 @@ def get_current_balance():
         return CONFIG['balance']
     return round(CONFIG['balance'] + df['profit_usdt'].sum(), 2)
 
+# --- ФУНКЦИЯ ЕЖЕДНЕВНОГО ОТЧЕТА ---
+async def send_daily_report(context: ContextTypes.DEFAULT_TYPE):
+    if not os.path.exists('history.csv'): return
+    df = pd.read_csv('history.csv')
+    if df.empty: return
+    
+    day_ago = datetime.now().timestamp() - 86400
+    df_today = df[df['timestamp'] >= day_ago]
+    
+    if df_today.empty:
+        await context.bot.send_message(chat_id=CONFIG['chat_id'], text="🌙 <b>Итоги дня:</b> новых сделок нет.", parse_mode='HTML')
+        return
+
+    total_pnl = round(df_today['profit_usdt'].sum(), 2)
+    wins = len(df_today[df_today['profit_usdt'] > 0])
+    losses = len(df_today[df_today['profit_usdt'] <= 0])
+    wr = round((wins / len(df_today)) * 100, 1)
+    
+    msg = (
+        f"📅 <b>ОТЧЕТ ЗА 24 ЧАСА (Киев)</b>\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"💰 Чистый PnL: <b>{total_pnl}$</b>\n"
+        f"🎯 Win Rate: <b>{wr}%</b> ({wins}W / {losses}L)\n"
+        f"🏦 Текущий баланс: <b>{get_current_balance()} USDT</b>"
+    )
+    await context.bot.send_message(chat_id=CONFIG['chat_id'], text=msg, parse_mode='HTML')
+
 class TradeJournal:
     def __init__(self, filename='history.csv'):
         self.filename = filename
@@ -66,11 +95,12 @@ class TradeJournal:
         try:
             df = pd.read_csv(self.filename)
             price_diff_pct = ((exit_p - entry) / entry) if side == 'LONG' else ((entry - exit_p) / entry)
-            current_balance = get_current_balance()
-            risk_amount = current_balance * CONFIG['risk_per_trade']
-            position_size_usdt = risk_amount / CONFIG['stop_loss_pct']
+            
+            # РАСЧЕТ ОТ ФИКСИРОВАННОГО ОБЪЕМА 1000$
+            position_size_usdt = CONFIG['fixed_order_size']
             commission_usdt = position_size_usdt * CONFIG['commission_rate']
             profit_usdt = (position_size_usdt * price_diff_pct) - commission_usdt
+            
             now = datetime.now()
             duration = int((now - start_time).total_seconds() / 60)
 
@@ -181,7 +211,6 @@ class SignalBot:
                     res_type = exit_reason if exit_reason else ("TAKE PROFIT 🎯" if is_tp else ("TRAILING STOP 📈" if trade.get('trailing_active') else "STOP LOSS 🛑"))
                     data = self.journal.log_trade(trade['symbol'], trade['side'], res_type, trade['entry'], curr_p, trade['start_time'])
                     
-                    # Запоминаем время выхода
                     self.last_exit_time[trade['symbol']] = time.time()
 
                     if data:
@@ -203,7 +232,6 @@ class SignalBot:
         for symbol in self.cfg['symbols']:
             if any(t['symbol'] == symbol for t in self.active_trades): continue
             
-            # ПРОВЕРКА ПАУЗЫ (COOLDOWN)
             if symbol in self.last_exit_time:
                 if time.time() - self.last_exit_time[symbol] < (self.cfg['cooldown_minutes'] * 60):
                     continue
@@ -223,9 +251,10 @@ class SignalBot:
         prec = 8 if price < 0.01 else (4 if price < 1 else 2)
         sl = round(price * (1 - self.cfg['stop_loss_pct']) if side == 'LONG' else price * (1 + self.cfg['stop_loss_pct']), prec)
         tp = round(price * (1 + self.cfg['take_profit_pct']) if side == 'LONG' else price * (1 - self.cfg['take_profit_pct']), prec)
-        current_balance = get_current_balance()
-        risk_amount = current_balance * self.cfg['risk_per_trade']
-        total_size = round(risk_amount / self.cfg['stop_loss_pct'], 2)
+        
+        # ФИКСИРОВАННЫЙ ОБЪЕМ 1000$
+        total_size = CONFIG['fixed_order_size']
+        
         trade_id = f"cl_{symbol.replace('/', '_')}_{datetime.now().microsecond}"
         self.active_trades.append({
             'symbol': symbol, 'side': side, 'entry': price, 'sl': sl, 'tp': tp, 
@@ -238,7 +267,7 @@ class SignalBot:
             f"📍 Вход: {price}\n"
             f"🛑 SL: {sl} (-{self.cfg['stop_loss_pct'] * 100}%)\n"
             f"🎯 TP: {tp} (+{self.cfg['take_profit_pct'] * 100}%)\n"
-            f"💰 Объем: {total_size} USDT (x{self.cfg['leverage']})"
+            f"💰 Объем: 1000 USDT (x{self.cfg['leverage']})"
         )
         await app_bot.send_message(chat_id=self.cfg['chat_id'], text=msg, parse_mode='HTML',
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Закрыть вручную", callback_data=trade_id)]]))
@@ -330,6 +359,11 @@ async def main():
     bot_instance = SignalBot(CONFIG)
     request_config = HTTPXRequest(connect_timeout=20.0, read_timeout=20.0)
     app = Application.builder().token(CONFIG['telegram_token']).request(request_config).build()
+    
+    # Настройка планировщика отчетов (00:00 Киев)
+    kiev_tz = pytz.timezone('Europe/Kyiv')
+    app.job_queue.run_daily(send_daily_report, time=dt_time(hour=0, minute=0, second=0, tzinfo=kiev_tz))
+    
     app.add_handlers([
         CommandHandler("start", start_cmd), CommandHandler("active", active_cmd), 
         CommandHandler("history", history_cmd), CommandHandler("help", help_cmd),
